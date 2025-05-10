@@ -49,11 +49,14 @@
 (define-constant DEFAULT-RESERVE-FACTOR u300000) ;; 30% of interest goes to reserves
 (define-constant MAX-UINT u340282366920938463463374607431768211455) ;; 2^128 - 1
 
+;; Track all supported tokens
+(define-data-var supported-tokens (list 100 principal) (list))
+
 ;; Data variables
 (define-data-var contract-owner principal tx-sender)
 (define-data-var treasury principal tx-sender)
 (define-data-var protocol-paused bool false)
-(define-data-var last-accrual-timestamp uint block-height)
+(define-data-var last-accrual-timestamp uint stacks-block-height)
 (define-data-var total-deposits uint u0)
 (define-data-var total-borrows uint u0)
 (define-data-var total-reserves uint u0)
@@ -144,7 +147,7 @@
     
     (match memo 
       memo-data (print {type: "ft_transfer_memo", token-id: "CLEND", memo: memo-data})
-      none)
+      none (true))  ;; Fix: Return a value of the same type as the other match arm
     
     (ok true)))
 
@@ -176,6 +179,11 @@
     (asserts! (< liquidation-penalty PRECISION) ERR-INVALID-AMOUNT)
     (asserts! (<= reserve-factor PRECISION) ERR-INVALID-AMOUNT)
     
+    ;; Add token to supported tokens list if not already present
+    (if (not (is-some (index-of (var-get supported-tokens) token-id)))
+        (var-set supported-tokens (append (var-get supported-tokens) token-id))
+        (ok true))
+    
     (map-set markets token-id {
       enabled: enabled,
       collateral-ratio: collateral-ratio,
@@ -186,7 +194,7 @@
       reserve-factor: reserve-factor,
       supply-cap: supply-cap,
       borrow-cap: borrow-cap,
-      last-interest-update: (default-to (- block-height u1) 
+      last-interest-update: (default-to (- stacks-block-height u1) 
                                (get last-interest-update (map-get? markets token-id)))
     })
     
@@ -238,7 +246,7 @@
 ;; Calculate the total value of a user's collateral in STX terms
 (define-read-only (get-user-total-collateral-value (user principal))
   (let 
-    ((tokens (get-all-market-tokens))
+    ((tokens (var-get supported-tokens))
      (total-value u0))
     (fold check-and-add-collateral total-value tokens)))
 
@@ -256,7 +264,7 @@
 ;; Calculate the total value of a user's borrows in STX terms
 (define-read-only (get-user-total-borrow-value (user principal))
   (let 
-    ((tokens (get-all-market-tokens))
+    ((tokens (var-get supported-tokens))
      (total-value u0))
     (fold add-borrow-value total-value tokens)))
 
@@ -271,7 +279,7 @@
 
 ;; Get all market tokens
 (define-read-only (get-all-market-tokens)
-  (map-keys markets))
+  (var-get supported-tokens))
 
 ;; Supply assets to the protocol
 (define-public (supply (token-id principal) (amount uint))
@@ -535,7 +543,7 @@
 (define-public (accrue-interest (token-id principal))
   (let 
     ((market (unwrap! (map-get? markets token-id) ERR-MARKET-NOT-FOUND))
-     (current-time block-height))
+     (current-time stacks-block-height))
     
     (if (>= current-time (get last-interest-update market))
       (let 
@@ -592,4 +600,4 @@
   (var-set contract-owner tx-sender)
   (var-set treasury tx-sender)
   (var-set token-decimals u6)
-  (var-set last-accrual-timestamp (- block-height u1)))
+  (var-set last-accrual-timestamp (- stacks-block-height u1)))
