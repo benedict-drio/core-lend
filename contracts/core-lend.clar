@@ -213,3 +213,100 @@
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
     (var-set treasury new-treasury)
     (ok true)))
+
+;; Pause/unpause protocol
+(define-public (set-protocol-pause (paused bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (var-set protocol-paused paused)
+    (ok true)))
+
+;; Core Protocol Functions
+
+;; Calculate the health factor of a user's position
+(define-read-only (get-health-factor (user principal))
+  (let 
+    ((total-collateral-value (get-user-total-collateral-value user))
+     (total-borrow-value (get-user-total-borrow-value user)))
+    
+    (if (is-eq total-borrow-value u0)
+      ;; If no borrows, return max health factor
+      (ok MAX-UINT)
+      ;; Otherwise calculate health factor = (collateral-value * PRECISION) / borrow-value
+      (ok (/ (* total-collateral-value PRECISION) total-borrow-value)))))
+
+;; Calculate the total value of a user's collateral in STX terms
+(define-read-only (get-user-total-collateral-value (user principal))
+  (let 
+    ((tokens (get-all-market-tokens))
+     (total-value u0))
+    (fold check-and-add-collateral total-value tokens)))
+
+;; Helper function to add collateral value for each token
+(define-private (check-and-add-collateral (total uint) (token principal))
+  (let 
+    ((position (default-to { supplied: u0, borrowed: u0, collateral-enabled: false }
+                  (map-get? user-positions { user: tx-sender, token: token })))
+     (price (default-to u0 (map-get? token-prices token))))
+    
+    (if (get collateral-enabled position)
+      (+ total (* (get supplied position) price))
+      total)))
+
+;; Calculate the total value of a user's borrows in STX terms
+(define-read-only (get-user-total-borrow-value (user principal))
+  (let 
+    ((tokens (get-all-market-tokens))
+     (total-value u0))
+    (fold add-borrow-value total-value tokens)))
+
+;; Helper function to add borrow value for each token
+(define-private (add-borrow-value (total uint) (token principal))
+  (let 
+    ((position (default-to { supplied: u0, borrowed: u0, collateral-enabled: false }
+                  (map-get? user-positions { user: tx-sender, token: token })))
+     (price (default-to u0 (map-get? token-prices token))))
+    
+    (+ total (* (get borrowed position) price))))
+
+;; Get all market tokens
+(define-read-only (get-all-market-tokens)
+  (map-keys markets))
+
+;; Supply assets to the protocol
+(define-public (supply (token-id principal) (amount uint))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PAUSED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    
+    (let 
+      ((market (unwrap! (map-get? markets token-id) ERR-MARKET-NOT-FOUND))
+       (current-supply (var-get total-deposits))
+       (position (default-to { supplied: u0, borrowed: u0, collateral-enabled: true }
+                   (map-get? user-positions { user: tx-sender, token: token-id }))))
+      
+      ;; Check market is enabled
+      (asserts! (get enabled market) ERR-MARKET-NOT-FOUND)
+      
+      ;; Check supply cap
+      (asserts! (<= (+ current-supply amount) (get supply-cap market)) ERR-MAX-BORROW-EXCEEDED)
+      
+      ;; Update internal accounting
+      (map-set user-positions { user: tx-sender, token: token-id }
+        {
+          supplied: (+ (get supplied position) amount),
+          borrowed: (get borrowed position),
+          collateral-enabled: (get collateral-enabled position)
+        })
+      
+      ;; Update total deposits
+      (var-set total-deposits (+ current-supply amount))
+      
+      ;; Transfer tokens to contract
+      (try! (contract-call? token-id transfer amount tx-sender (as-contract tx-sender) none))
+      
+      ;; Mint CLEND tokens to represent share
+      (map-set token-balances tx-sender 
+               (+ (default-to u0 (map-get? token-balances tx-sender)) amount))
+      
+      (ok true))))
