@@ -310,3 +310,114 @@
                (+ (default-to u0 (map-get? token-balances tx-sender)) amount))
       
       (ok true))))
+
+;; Enable/disable using an asset as collateral
+(define-public (set-collateral-enabled (token-id principal) (enabled bool))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PAUSED)
+    
+    (let 
+      ((position (unwrap! (map-get? user-positions { user: tx-sender, token: token-id }) 
+                         ERR-INSUFFICIENT-BALANCE)))
+      
+      ;; Update collateral settings
+      (map-set user-positions { user: tx-sender, token: token-id }
+        {
+          supplied: (get supplied position),
+          borrowed: (get borrowed position),
+          collateral-enabled: enabled
+        })
+      
+      ;; If disabling collateral, check health factor remains good
+      (if (and (not enabled) (> (get borrowed position) u0))
+        (let ((health-factor (unwrap! (get-health-factor tx-sender) ERR-BELOW-COLLATERAL-RATIO)))
+          ;; Health factor must remain above collateral ratio
+          (asserts! (>= health-factor DEFAULT-COLLATERAL-RATIO) ERR-BELOW-COLLATERAL-RATIO)
+          (ok true))
+        (ok true)))))
+
+;; Withdraw supplied assets
+(define-public (withdraw (token-id principal) (amount uint))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PAUSED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    
+    (let 
+      ((position (unwrap! (map-get? user-positions { user: tx-sender, token: token-id }) 
+                         ERR-INSUFFICIENT-BALANCE)))
+      
+      ;; Check user has enough supplied
+      (asserts! (>= (get supplied position) amount) ERR-INSUFFICIENT-BALANCE)
+      
+      ;; Update internal accounting
+      (map-set user-positions { user: tx-sender, token: token-id }
+        {
+          supplied: (- (get supplied position) amount),
+          borrowed: (get borrowed position),
+          collateral-enabled: (get collateral-enabled position)
+        })
+      
+      ;; Update total deposits
+      (var-set total-deposits (- (var-get total-deposits) amount))
+      
+      ;; Check health factor after withdrawal
+      (let ((health-factor (unwrap! (get-health-factor tx-sender) ERR-BELOW-COLLATERAL-RATIO)))
+        ;; Health factor must remain above collateral ratio if user has borrows
+        (asserts! (or (is-eq (get-user-total-borrow-value tx-sender) u0)
+                      (>= health-factor DEFAULT-COLLATERAL-RATIO)) 
+                  ERR-BELOW-COLLATERAL-RATIO)
+        
+        ;; Burn CLEND tokens
+        (map-set token-balances tx-sender 
+                 (- (default-to u0 (map-get? token-balances tx-sender)) amount))
+        
+        ;; Transfer tokens from contract to user
+        (as-contract (try! (contract-call? token-id transfer amount tx-sender tx-sender none)))
+        
+        (ok true)))))
+
+;; Borrow assets against collateral
+(define-public (borrow (token-id principal) (amount uint))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PAUSED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    
+    (let 
+      ((market (unwrap! (map-get? markets token-id) ERR-MARKET-NOT-FOUND))
+       (position (default-to { supplied: u0, borrowed: u0, collateral-enabled: true }
+                   (map-get? user-positions { user: tx-sender, token: token-id })))
+       (current-borrows (var-get total-borrows))
+       (origination-fee-amount (/ (* amount (get origination-fee market)) PRECISION)))
+      
+      ;; Check market is enabled
+      (asserts! (get enabled market) ERR-MARKET-NOT-FOUND)
+      
+      ;; Check borrow cap
+      (asserts! (<= (+ current-borrows amount) (get borrow-cap market)) ERR-MAX-BORROW-EXCEEDED)
+      
+      ;; Update accrued interest before borrowing
+      (try! (accrue-interest token-id))
+      
+      ;; Update internal accounting - include origination fee in borrowed amount
+      (map-set user-positions { user: tx-sender, token: token-id }
+        {
+          supplied: (get supplied position),
+          borrowed: (+ (get borrowed position) amount origination-fee-amount),
+          collateral-enabled: (get collateral-enabled position)
+        })
+      
+      ;; Update total borrows
+      (var-set total-borrows (+ current-borrows amount origination-fee-amount))
+      
+      ;; Check health factor after borrow
+      (let ((health-factor (unwrap! (get-health-factor tx-sender) ERR-BELOW-COLLATERAL-RATIO)))
+        ;; Health factor must remain above collateral ratio
+        (asserts! (>= health-factor DEFAULT-COLLATERAL-RATIO) ERR-BELOW-COLLATERAL-RATIO)
+        
+        ;; Add origination fee to reserves
+        (var-set total-reserves (+ (var-get total-reserves) origination-fee-amount))
+        
+        ;; Transfer tokens from contract to user
+        (as-contract (try! (contract-call? token-id transfer amount tx-sender tx-sender none)))
+        
+        (ok true)))))
