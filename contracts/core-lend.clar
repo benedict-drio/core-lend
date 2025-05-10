@@ -105,3 +105,111 @@
 (define-map token-prices
   principal
   uint)
+
+;; Functions
+
+;; SIP-010 Functions
+(define-read-only (get-name)
+  (ok (var-get token-name)))
+
+(define-read-only (get-symbol)
+  (ok (var-get token-symbol)))
+
+(define-read-only (get-decimals)
+  (ok (var-get token-decimals)))
+
+(define-read-only (get-balance (account principal))
+  (ok (default-to u0 (map-get? token-balances account))))
+
+(define-read-only (get-total-supply)
+  (ok (var-get total-deposits)))
+
+(define-read-only (get-token-uri)
+  (ok (var-get token-uri)))
+
+(define-public (transfer (amount uint) (sender principal) (recipient principal) (memo (optional (buff 34))))
+  (begin
+    (asserts! (or (is-eq tx-sender sender) 
+                 (>= (default-to u0 (map-get? token-approvals {owner: sender, operator: tx-sender})) amount))
+      ERR-NOT-AUTHORIZED)
+    (asserts! (>= (default-to u0 (map-get? token-balances sender)) amount) ERR-INSUFFICIENT-BALANCE)
+    
+    (map-set token-balances sender 
+      (- (default-to u0 (map-get? token-balances sender)) amount))
+    
+    (map-set token-balances recipient 
+      (+ (default-to u0 (map-get? token-balances recipient)) amount))
+    
+    (print {type: "ft_transfer_event", token-id: "CLEND", amount: amount, sender: sender, recipient: recipient})
+    
+    (match memo 
+      memo-data (print {type: "ft_transfer_memo", token-id: "CLEND", memo: memo-data})
+      none)
+    
+    (ok true)))
+
+(define-public (transfer-memo (amount uint) (sender principal) (recipient principal) (memo (buff 34)))
+  (transfer amount sender recipient (some memo)))
+
+(define-public (approve (operator principal) (amount uint))
+  (begin
+    (map-set token-approvals {owner: tx-sender, operator: operator} amount)
+    (print {type: "ft_approve", token-id: "CLEND", spender: operator, amount: amount})
+    (ok true)))
+
+;; Protocol Admin Functions
+
+;; Initialize or update a market
+(define-public (set-market (token-id principal) 
+                         (enabled bool)
+                         (collateral-ratio uint) 
+                         (liquidation-ratio uint)
+                         (liquidation-penalty uint)
+                         (interest-rate uint)
+                         (origination-fee uint)
+                         (reserve-factor uint)
+                         (supply-cap uint)
+                         (borrow-cap uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (>= collateral-ratio liquidation-ratio) ERR-INVALID-AMOUNT)
+    (asserts! (< liquidation-penalty PRECISION) ERR-INVALID-AMOUNT)
+    (asserts! (<= reserve-factor PRECISION) ERR-INVALID-AMOUNT)
+    
+    (map-set markets token-id {
+      enabled: enabled,
+      collateral-ratio: collateral-ratio,
+      liquidation-ratio: liquidation-ratio,
+      liquidation-penalty: liquidation-penalty,
+      interest-rate: interest-rate,
+      origination-fee: origination-fee,
+      reserve-factor: reserve-factor,
+      supply-cap: supply-cap,
+      borrow-cap: borrow-cap,
+      last-interest-update: (default-to (- block-height u1) 
+                               (get last-interest-update (map-get? markets token-id)))
+    })
+    
+    (ok true)))
+
+;; Set token price from oracle
+(define-public (set-token-price (token-id principal) (price uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (> price u0) ERR-INVALID-AMOUNT)
+    (map-set token-prices token-id price)
+    (ok true)))
+
+;; Transfer contract ownership
+(define-public (transfer-ownership (new-owner principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (var-set contract-owner new-owner)
+    (ok true)))
+
+;; Set treasury address
+(define-public (set-treasury (new-treasury principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (var-set treasury new-treasury)
+    (ok true)))
