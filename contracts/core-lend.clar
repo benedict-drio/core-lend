@@ -421,3 +421,112 @@
         (as-contract (try! (contract-call? token-id transfer amount tx-sender tx-sender none)))
         
         (ok true)))))
+
+;; Repay borrowed assets
+(define-public (repay (token-id principal) (amount uint))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PAUSED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    
+    (let 
+      ((position (unwrap! (map-get? user-positions { user: tx-sender, token: token-id }) 
+                         ERR-INSUFFICIENT-BALANCE)))
+      
+      ;; Update accrued interest before repaying
+      (try! (accrue-interest token-id))
+      
+      ;; Determine actual repay amount (can't repay more than borrowed)
+      (let ((actual-repay (if (> amount (get borrowed position))
+                            (get borrowed position)
+                            amount)))
+        
+        ;; Update internal accounting
+        (map-set user-positions { user: tx-sender, token: token-id }
+          {
+            supplied: (get supplied position),
+            borrowed: (- (get borrowed position) actual-repay),
+            collateral-enabled: (get collateral-enabled position)
+          })
+        
+        ;; Update total borrows
+        (var-set total-borrows (- (var-get total-borrows) actual-repay))
+        
+        ;; Transfer tokens from user to contract
+        (try! (contract-call? token-id transfer actual-repay tx-sender (as-contract tx-sender) none))
+        
+        (ok true)))))
+
+;; Liquidate undercollateralized positions
+(define-public (liquidate (borrower principal) (debt-token principal) (collateral-token principal) (debt-amount uint))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PAUSED)
+    (asserts! (> debt-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (not (is-eq borrower tx-sender)) ERR-NOT-AUTHORIZED)
+    
+    ;; Get borrower positions
+    (let 
+      ((debt-position (unwrap! (map-get? user-positions { user: borrower, token: debt-token }) 
+                           ERR-MARKET-NOT-FOUND))
+       (collateral-position (unwrap! (map-get? user-positions { user: borrower, token: collateral-token }) 
+                               ERR-MARKET-NOT-FOUND))
+       (debt-market (unwrap! (map-get? markets debt-token) ERR-MARKET-NOT-FOUND))
+       (collateral-market (unwrap! (map-get? markets collateral-token) ERR-MARKET-NOT-FOUND))
+       (health-factor (unwrap! (get-health-factor borrower) ERR-CANNOT-LIQUIDATE)))
+      
+      ;; Check collateral is enabled for the borrower
+      (asserts! (get collateral-enabled collateral-position) ERR-CANNOT-LIQUIDATE)
+      
+      ;; Check borrower is undercollateralized (health factor below liquidation threshold)
+      (asserts! (< health-factor (get liquidation-ratio debt-market)) ERR-CANNOT-LIQUIDATE)
+      
+      ;; Update accrued interest before liquidation
+      (try! (accrue-interest debt-token))
+      (try! (accrue-interest collateral-token))
+      
+      ;; Determine actual liquidation amount (can't liquidate more than borrowed)
+      (let 
+        ((actual-debt-amount (if (> debt-amount (get borrowed debt-position))
+                               (get borrowed debt-position)
+                               debt-amount))
+         (debt-token-price (unwrap! (map-get? token-prices debt-token) ERR-MARKET-NOT-FOUND))
+         (collateral-token-price (unwrap! (map-get? token-prices collateral-token) ERR-MARKET-NOT-FOUND)))
+        
+        ;; Calculate collateral to seize with bonus
+        (let 
+          ((debt-value-stx (* actual-debt-amount debt-token-price))
+           (liquidation-bonus (+ PRECISION (get liquidation-penalty debt-market)))
+           (collateral-to-seize (/ (* debt-value-stx liquidation-bonus) 
+                                  (* collateral-token-price PRECISION))))
+          
+          ;; Can't seize more than available
+          (let 
+            ((actual-collateral-to-seize (if (> collateral-to-seize (get supplied collateral-position))
+                                          (get supplied collateral-position)
+                                          collateral-to-seize)))
+            
+            ;; Update borrower's debt position
+            (map-set user-positions { user: borrower, token: debt-token }
+              {
+                supplied: (get supplied debt-position),
+                borrowed: (- (get borrowed debt-position) actual-debt-amount),
+                collateral-enabled: (get collateral-enabled debt-position)
+              })
+            
+            ;; Update borrower's collateral position
+            (map-set user-positions { user: borrower, token: collateral-token }
+              {
+                supplied: (- (get supplied collateral-position) actual-collateral-to-seize),
+                borrowed: (get borrowed collateral-position),
+                collateral-enabled: (get collateral-enabled collateral-position)
+              })
+            
+            ;; Update total borrows
+            (var-set total-borrows (- (var-get total-borrows) actual-debt-amount))
+            
+            ;; Transfer debt tokens from liquidator to contract
+            (try! (contract-call? debt-token transfer actual-debt-amount tx-sender (as-contract tx-sender) none))
+            
+            ;; Transfer collateral tokens from contract to liquidator
+            (as-contract (try! (contract-call? collateral-token transfer actual-collateral-to-seize tx-sender tx-sender none)))
+            
+            (ok true)))))))
