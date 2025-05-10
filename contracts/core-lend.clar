@@ -530,3 +530,66 @@
             (as-contract (try! (contract-call? collateral-token transfer actual-collateral-to-seize tx-sender tx-sender none)))
             
             (ok true)))))))
+
+;; Accrue interest for a specific market
+(define-public (accrue-interest (token-id principal))
+  (let 
+    ((market (unwrap! (map-get? markets token-id) ERR-MARKET-NOT-FOUND))
+     (current-time block-height))
+    
+    (if (>= current-time (get last-interest-update market))
+      (let 
+        ((time-elapsed (- current-time (get last-interest-update market)))
+         (interest-rate (get interest-rate market))
+         (reserve-factor (get reserve-factor market))
+         (total-borrows-for-token (var-get total-borrows)))
+        
+        ;; Only accrue if there are borrows and time has passed
+        (if (and (> total-borrows-for-token u0) (> time-elapsed u0))
+          (let 
+            (;; Calculate interest: principal * rate * time / (seconds in year * PRECISION)
+             (interest-amount (/ (* total-borrows-for-token interest-rate time-elapsed) 
+                               (* u31536000 PRECISION))) ;; 365 days in seconds
+             ;; Calculate reserves: interest * reserve-factor / PRECISION
+             (reserves-amount (/ (* interest-amount reserve-factor) PRECISION)))
+            
+            ;; Update total borrows with interest
+            (var-set total-borrows (+ total-borrows-for-token interest-amount))
+            
+            ;; Update reserves
+            (var-set total-reserves (+ (var-get total-reserves) reserves-amount))
+            
+            ;; Update last interest update timestamp
+            (map-set markets token-id
+              (merge market { last-interest-update: current-time }))
+            
+            (ok true))
+          (begin
+            ;; Just update timestamp if no interest to accrue
+            (map-set markets token-id
+              (merge market { last-interest-update: current-time }))
+            (ok true))))
+      ;; No time has passed
+      (ok true))))
+
+;; Admin function to withdraw reserves
+(define-public (withdraw-reserves (token-id principal) (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (<= amount (var-get total-reserves)) ERR-INSUFFICIENT-BALANCE)
+    
+    ;; Update total reserves
+    (var-set total-reserves (- (var-get total-reserves) amount))
+    
+    ;; Transfer tokens to treasury
+    (as-contract (try! (contract-call? token-id transfer amount tx-sender (var-get treasury) none)))
+    
+    (ok true)))
+
+;; Initialize contract with default values
+(begin
+  (var-set contract-owner tx-sender)
+  (var-set treasury tx-sender)
+  (var-set token-decimals u6)
+  (var-set last-accrual-timestamp (- block-height u1)))
